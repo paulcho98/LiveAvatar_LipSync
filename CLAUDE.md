@@ -15,6 +15,19 @@ This repository integrates two projects for audio-driven lipsync video generatio
 
 **Conda environment:** `hb_liveavatar`
 
+## Temporal Compression & Block-wise Generation
+
+The Wan VAE uses temporal stride 4: `Tzip = 1 + (N-1)/4` where N is the number of video frames.
+- **81 video frames → 21 latent frames** (1 + 80/4 = 21)
+- **Each block = 3 latent frames** (= 12 video frames + 1 overlap)
+- **7 blocks per clip** (21 / 3 = 7), NOT 27
+
+This applies to both LiveAvatar and Self-Forcing. All block counts, KV cache sizes, and audio slicing must use 7 blocks / 21 latent frames for 81-frame videos.
+
+## Integration Principle: LiveAvatar-First
+
+The integration strategy is to keep LiveAvatar's model, audio pipeline (wav2vec2), KV cache management, and inference logic **exactly as-is**. The ONLY modification is expanding the input layer from 16 to 49 channels to accept the lipsync conditioning (masked latents + mask + reference latents). Everything else — audio processing, attention, KV caching, block-wise generation — stays faithful to LiveAvatar.
+
 ## 49-Channel Input Format (from Self-Forcing LatentSync)
 
 The training input is a 49-channel tensor `[B, 49, Tzip, H/8, W/8]` constructed by concatenating:
@@ -26,52 +39,23 @@ The training input is a 49-channel tensor `[B, 49, Tzip, H/8, W/8]` constructed 
 | Mask | 1 | Fixed mouth-region mask resized to latent space (trilinear interpolation) |
 | Reference latents | 16 | VAE-encoded reference frames for facial identity |
 
-Constructed in `WanVideoUnit_MaskedInputVideoEmbedderVAE_LatentSync_Exact` (wan_video_new.py:6732-6924):
-- `y = cat([mask(1), masked_latents(16), ref_latents(16)])` → 33 channels of conditioning
-- In `model_fn_audio_stage2_stableavatar`: `x_concat = cat([noisy_latents(16), y(33)])` → 49 channels
+Constructed in `train_lipsync.py:construct_49ch_block()`:
+- `x_49 = cat([noisy_block(16), mask_block(1), masked_block(16), ref_block(16)])` → 49 channels
+- Built per temporal block (3 latent frames) during the block-wise forward loop
 
-## Self-Forcing Training Execution Path
+## Self-Forcing Reference (External Repo)
 
-**Entry:** `train_lipsync_combined_latentsync_latentsync_exact_full_finetune.sh`
+The Self-Forcing LipSync StableAvatar repo is the *reference* for the 49-channel lipsync input format. Key architectural differences from LiveAvatar:
 
-Key args: `--extra_inputs="audio_emb,masks"`, `--use_causal_wan`, `--causal_wan_kwargs '{"in_dim": 49, ...}'`, `--use_latentsync_audio`, `--audio_proj_type "hallo3_keepdim"`, `--training_stage 2`
+| Aspect | Self-Forcing | LiveAvatar (ours) |
+|--------|-------------|-------------------|
+| Audio encoder | Whisper Tiny (384-dim) | wav2vec2-large-xlsr-53 (1024-dim × 25 layers) |
+| Hidden dim | 2048 | 5120 |
+| Transformer layers | 32 | 40 |
+| Audio projection | AudioProjModelHallo3 → cross-attn | CausalAudioEncoder (weighted layer sum → temporal conv → 5120) |
+| Model size | ~1.3B | ~14B |
 
-### LatentSync Audio Path
-
-1. **Audio encoder init** (train.py:342-367): Whisper Tiny via `latentsync_whisper.audio2feature.Audio2Feature` → 384-dim embeddings, window_size=10
-2. **Per-frame extraction** (train.py:1244-1282): For each video frame, extract windowed Whisper features → `[1, 81, 10, 384]` (batch, frames, window, dim)
-3. **use_new_forward alignment** (train.py:1314-1327): Prepend 9 zero-windows, truncate end → still `[1, 81, 10, 384]`
-
-### Training Forward Pass
-
-```
-train.py:forward_preprocess() → build_lipsync_inputs()
-  ↓
-pipe.training_loss(**inputs)                              (wan_video_new.py:4139)
-  ↓ forward_fn = model_fn_audio_stage2_stableavatar       (stage 2)
-  ↓
-model_fn_audio_stage2_stableavatar()                      (wan_video_new.py:4497)
-  → x_concat = cat([noisy_latents, y], dim=1)             → [B, 49, F, H, W]
-  ↓
-dit(x_concat, vocal_embeddings=audio_emb, ...)            (wan_video_new.py:4654)
-  ↓
-CausalWanModelLatentSync.forward()                        (causal_model_latentsync.py:1910)
-  → patch_embedding(49ch → 2048 dim)
-  → audio_projection(audio_emb) via AudioProjModelHallo3  → [B, 81, 32, 384]
-  → 32 transformer blocks with audio cross-attention
-  → head + unpatchify → [B, 16, T, H, W] velocity prediction
-  ↓
-MSE loss with optional mouth-region weighting
-```
-
-### Key Self-Forcing Training Files
-
-| File | Path (relative to Self-Forcing repo) | Purpose |
-|------|------|---------|
-| train.py | `examples/wanvideo/model_training/train.py` | Training loop, data preprocessing, audio extraction |
-| wan_video_new.py | `diffsynth/pipelines/wan_video_new.py` | Pipeline: training_loss, forward functions, 49ch unit |
-| causal_model_latentsync.py | `diffsynth/models/wan_models/causal_model_latentsync.py` | CausalWanModelLatentSync (in_dim=49, audio cross-attn) |
-| vocal_projector_fantasy_1B.py | `diffsynth/models/wan_models/vocal_projector_fantasy_1B.py` | Audio→cross-attention projection |
+We do not modify the Self-Forcing repo. Its code is used only as reference for the 49-channel input construction and mouth-weighted MSE loss.
 
 ## LiveAvatar Inference Execution Path
 
@@ -117,6 +101,18 @@ WanS2V.generate()                                         (causal_s2v_pipeline.p
     Previous clip's tail → next clip's motion frames (continuity)
 ```
 
+### Per-Timestep KV Caches
+
+LiveAvatar maintains **4 independent KV caches** (`kv_cache1["1"]` through `kv_cache1["4"]`), one per denoising timestep. Both single-GPU and TPP pipelines use this pattern (see `causal_s2v_pipeline.py:995` — `for gpu_id in range(4): self._initialize_kv_cache(...)`).
+
+- Each timestep `i` writes to its own cache: `kv_cache1[str(i+1)]`
+- Block N+1 at timestep `i` attends to block N's timestep-`i` entry (same noise level)
+- Prefill (`_forward_sink`) populates all 4 caches at `t=0` (conditional cache: `cond_k`/`cond_v`)
+- Conditional caches can be shared across timesteps via `shared_cond_cache` (same motion/ref tokens regardless of σ)
+- On single GPU, caches are swapped on/off GPU as needed (`_move_kv_cache_to_working_gpu`)
+
+**Training simplification:** Our training uses a **single KV cache** because only one σ is sampled per training step (shared across all 7 blocks). This is consistent with inference: within any single per-timestep cache, all blocks share the same noise level.
+
 ### LiveAvatar Model Architecture (CausalWanModel_S2V)
 
 **File:** `LiveAvatar/liveavatar/models/wan/causal_model_s2v.py` (Lines 438-1580)
@@ -143,6 +139,41 @@ WanS2V.generate()                                         (causal_s2v_pipeline.p
 | `liveavatar/models/wan/wan_2_2/configs/wan_s2v_14B_modified.py` | Model config (dims, layers, audio injection layers) |
 | `liveavatar/models/wan/wan_2_2/utils/fm_solvers.py` | Flow-matching Euler scheduler |
 
+## Training Implementation Details (train_lipsync.py)
+
+### Audio-Video Alignment
+
+- **Dataset always starts from frame 0** (no random temporal crop). This is required because `audio_path` points to the full source video, and `get_audio_embed_bucket_fps` extracts features starting from the beginning of the audio.
+- **Audio truncated to 84 entries**: `get_audio_embed_bucket_fps(z, fps=25, batch_frames=84, m=0)` returns `min_batch_num * batch_frames` entries covering the full audio duration. We truncate to the first 84: `audio_bucket = audio_bucket[:84]`.
+- **84 = 7 blocks × 12 video-frames/block**. Each block processes 3 latent frames = 12 video frames at 25 fps.
+
+### KV Cache in Training
+
+- **Single KV cache** (not 4 per-timestep caches like inference) — sufficient because one σ is sampled per training step, shared across all 7 blocks.
+- This is consistent with inference: within any single per-timestep cache, all blocks write at the same noise level.
+- Prefill via `_forward_sink` at `t=0` populates conditional caches (`cond_k`/`cond_v`), then blocks run `_forward_inference` at the sampled σ.
+- Cache is reset between training samples (`reset_kv_cache` + `reset_crossattn_cache`).
+
+### Loss Computation
+
+- **Full-sequence backward**: All 7 blocks run forward, collecting velocity predictions into a list. `torch.cat(predictions, dim=2)` assembles the full `[B, 16, 21, H_lat, W_lat]` output. One MSE loss over all 21 latent frames, then a single `backward()` call.
+- **Must use `torch.cat`, NOT in-place slice assignment.** `velocity_output[:, :, start:end] = pred` on a `torch.zeros_like` tensor severs the autograd graph — the target tensor has `requires_grad=False`, so PyTorch copies data without creating an autograd connection. This causes (a) zero gradients reaching the model (no learning) and (b) a memory leak (~32GB/iter) because `backward()` never traverses the disconnected block graphs so they are never freed.
+- **Mouth-weighted MSE**: `weight = 1 + (W_mouth - 1) * mask`, default `W_mouth=5.0`. The mask is trilinearly interpolated from pixel-space mouth mask to latent space.
+- Gradient checkpointing is enabled on the base model (`gradient_checkpointing = True`) to reduce memory during backward.
+- Audio embeddings stored on `self` by `_forward_inference` are detached after each block to prevent graph accumulation.
+
+### Memory Breakdown (512×512, batch=1, bf16)
+
+| Component | Size | Notes |
+|-----------|------|-------|
+| Model params (14B bf16) | ~28 GB | LoRA adds ~0.5 GB trainable on top |
+| KV cache (40 layers × 21504 entries × 40 heads × 128 dim × 2 bytes × k+v) | ~17.6 GB | 21504 = 21 latent frames × 1024 tokens/frame |
+| Cond KV cache (40 layers × 2800 entries × same shape) | ~2.3 GB | Motion + ref + text conditioning |
+| Cross-attn cache (40 layers, dynamic) | ~0.1 GB | Audio cross-attention; small |
+| Latent tensors (x_0, x_t, noise, target, masked, ref, mask) | ~0.1 GB | 7 × [1, 16, 21, 64, 64] |
+| **Total before forward** | **~50–56 GB** | Leaves ~24 GB for activations + gradients on 80GB GPU |
+
+Conditioning models (VAE, wav2vec2, T5) are offloaded to CPU after preprocessing to stay within GPU budget.
 
 ## Video Stitching for Validation Outputs
 
