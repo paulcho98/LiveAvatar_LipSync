@@ -2,10 +2,11 @@
 LiveAvatar LipSync Training Script.
 
 Trains LiveAvatar's CausalWanModel_S2V for lip-sync V2V inpainting using diffusion loss.
-The ONLY architecture change is expanding patch_embedding Conv3d from 16->49 input channels.
+The ONLY architecture change is expanding patch_embedding Conv3d from 16->49 (or 33) input channels.
 Everything else (wav2vec2 audio, causal attention, KV cache, block-wise generation) stays unchanged.
 
 49 channels = 16 (noisy latents) + 1 (mouth mask) + 16 (masked latents) + 16 (reference latents)
+33 channels = 16 (noisy latents) + 1 (mouth mask) + 16 (masked latents)  [use_ref_frames: false]
 
 Usage:
     accelerate launch train_lipsync.py --config configs/lipsync_train.yaml
@@ -50,6 +51,15 @@ def zero_pad_to_49ch(latents_16ch):
     return torch.cat([latents_16ch, pad], dim=1)
 
 
+def zero_pad_to_33ch(latents_16ch):
+    """Pad 16-channel latents to 33 channels with zeros.
+    [B, 16, T, H, W] -> [B, 33, T, H, W]
+    """
+    B, _C, T, H, W = latents_16ch.shape
+    pad = torch.zeros(B, 17, T, H, W, dtype=latents_16ch.dtype, device=latents_16ch.device)
+    return torch.cat([latents_16ch, pad], dim=1)
+
+
 def construct_49ch_block(noisy_block, mask_block, masked_block, ref_block):
     """Construct 49-channel model input for one temporal block.
 
@@ -62,6 +72,13 @@ def construct_49ch_block(noisy_block, mask_block, masked_block, ref_block):
     Returns: [B, 49, 3, H, W]
     """
     return torch.cat([noisy_block, mask_block, masked_block, ref_block], dim=1)
+
+
+def construct_33ch_block(noisy_block, mask_block, masked_block):
+    """Construct 33-channel model input (no reference latents).
+    Returns: [B, 33, 3, H, W]
+    """
+    return torch.cat([noisy_block, mask_block, masked_block], dim=1)
 
 
 def vae_encode_batch(vae, videos):
@@ -92,7 +109,7 @@ def move_vae(vae, device):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_and_prepare_model(config, device):
-    """Load pretrained CausalWanModel_S2V, expand to 49ch, apply LoRA.
+    """Load pretrained CausalWanModel_S2V, expand to 49ch (or 33ch), apply LoRA.
 
     Supports loading the LiveAvatar DMD (distillation) LoRA checkpoint in two modes:
       merge_dmd_lora=True:  merge DMD into base weights, then apply fresh LoRA
@@ -126,18 +143,21 @@ def load_and_prepare_model(config, device):
         model = model.merge_and_unload()
         logger.info(f"DMD LoRA merged into base weights from {dmd_lora_path}")
 
-    # 3. Expand patch_embedding: 16 -> 49
+    # 3. Expand patch_embedding: 16 -> in_channels (49 with ref frames, 33 without)
+    use_ref_frames = config.get("use_ref_frames", True)
+    in_channels = 49 if use_ref_frames else 33
+
     old_conv = model.patch_embedding
     dim = model.dim
     patch_size = tuple(model.patch_size)
-    new_conv = nn.Conv3d(49, dim, kernel_size=patch_size, stride=patch_size)
+    new_conv = nn.Conv3d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
     with torch.no_grad():
         new_conv.weight.zero_()
         new_conv.weight[:, :16] = old_conv.weight
         new_conv.bias.data.copy_(old_conv.bias.data)
     model.patch_embedding = new_conv
-    model.in_dim = 49
-    logger.info("Expanded patch_embedding: 16 -> 49 channels")
+    model.in_dim = in_channels
+    logger.info(f"Expanded patch_embedding: 16 -> {in_channels} channels")
 
     # 4. Apply LoRA
     lora_targets = config.get("lora_targets", "q,k,v,o,ffn.0,ffn.2").split(",")
@@ -341,6 +361,7 @@ def training_step(
     Returns: loss value as float (backward already performed)
     """
     use_precomputed = "x_0" in batch
+    use_ref_frames = config.get("use_ref_frames", True)
     batch_size = batch["x_0"].shape[0] if use_precomputed else batch["video"].shape[0]
     num_blocks = 7
     latent_frames_per_block = 3
@@ -357,7 +378,8 @@ def training_step(
         # Full precomputed path — no VAE needed
         x_0 = batch["x_0"].to(device, dtype=torch.bfloat16)
         masked_latents = batch["masked_latents"].to(device, dtype=torch.bfloat16)
-        ref_latents_49ch = batch["ref_latents_49ch"].to(device, dtype=torch.bfloat16)
+        if use_ref_frames:
+            ref_latents_49ch = batch["ref_latents_49ch"].to(device, dtype=torch.bfloat16)
         ref_latents_sink = batch["ref_latents_sink"].to(device, dtype=torch.bfloat16)
         motion_latents = batch["motion_latents"].to(device, dtype=torch.bfloat16)
         mask_latent = batch["mask_latent"].to(device, dtype=torch.bfloat16)
@@ -382,7 +404,8 @@ def training_step(
             masked_latents = vae_encode_batch(vae, masked_video)  # [B, 16, 21, H_lat, W_lat]
 
             # Reference -> latents for 49-ch input (per-block identity conditioning)
-            ref_latents_49ch = vae_encode_batch(vae, ref_frames)  # [B, 16, 21, H_lat, W_lat]
+            if use_ref_frames:
+                ref_latents_49ch = vae_encode_batch(vae, ref_frames)  # [B, 16, 21, H_lat, W_lat]
 
             # Reference -> single frame latent for _forward_sink (conditioning cache)
             # VAE CausalConv3d needs 5 frames for proper temporal context; [:,:,1:] selects
@@ -500,7 +523,8 @@ def training_step(
     # ── STEP 4: Noise + target (restricted 4-step) ────────────────────────
     x_0 = x_0.to(device, dtype=torch.bfloat16)
     masked_latents = masked_latents.to(device, dtype=torch.bfloat16)
-    ref_latents_49ch = ref_latents_49ch.to(device, dtype=torch.bfloat16)
+    if use_ref_frames:
+        ref_latents_49ch = ref_latents_49ch.to(device, dtype=torch.bfloat16)
     ref_latents_sink = ref_latents_sink.to(device, dtype=torch.bfloat16)
     motion_latents = motion_latents.to(device, dtype=torch.bfloat16)
     mask_latent = mask_latent.to(device, dtype=torch.bfloat16)
@@ -514,7 +538,10 @@ def training_step(
     velocity_target = noise - x_0  # [B, 16, 21, H_lat, W_lat]
 
     # ── STEP 5: Prepare padding + caches ──────────────────────────────────
-    ref_latents_padded = zero_pad_to_49ch(ref_latents_sink)  # [B, 49, 1, H_lat, W_lat]
+    if use_ref_frames:
+        ref_latents_padded = zero_pad_to_49ch(ref_latents_sink)  # [B, 49, 1, H_lat, W_lat]
+    else:
+        ref_latents_padded = zero_pad_to_33ch(ref_latents_sink)  # [B, 33, 1, H_lat, W_lat]
     # patch_size=(1,2,2) spatial downsampling: each latent frame -> (H_lat/2)*(W_lat/2) tokens
     frame_seq_length = (H_lat // 2) * (W_lat // 2)
 
@@ -575,13 +602,16 @@ def training_step(
             x_t_block = x_t[:, :, block_start_frame:block_end_frame]
             mask_block = mask_latent[:, :, block_start_frame:block_end_frame]
             masked_block = masked_latents[:, :, block_start_frame:block_end_frame]
-            ref_block = ref_latents_49ch[:, :, block_start_frame:block_end_frame]
 
             # Audio for this block: 12 video frames per block
             audio_block = audio_emb[..., block_idx * 12 : (block_idx + 1) * 12]
 
-            # Build 49-channel input
-            x_49 = construct_49ch_block(x_t_block, mask_block, masked_block, ref_block)
+            # Build channel input (49ch with ref frames, 33ch without)
+            if use_ref_frames:
+                ref_block = ref_latents_49ch[:, :, block_start_frame:block_end_frame]
+                x_49 = construct_49ch_block(x_t_block, mask_block, masked_block, ref_block)
+            else:
+                x_49 = construct_33ch_block(x_t_block, mask_block, masked_block)
 
             # Timestep: [B, 3] same value across all frames in block
             t_block = timestep_val.unsqueeze(1).expand(batch_size, latent_frames_per_block).float()
@@ -646,10 +676,13 @@ def training_step(
         x_t_block = x_t[:, :, block_start_frame:block_end_frame]
         mask_block = mask_latent[:, :, block_start_frame:block_end_frame]
         masked_block = masked_latents[:, :, block_start_frame:block_end_frame]
-        ref_block = ref_latents_49ch[:, :, block_start_frame:block_end_frame]
         audio_block = audio_emb[..., block_idx * 12 : (block_idx + 1) * 12]
 
-        x_49 = construct_49ch_block(x_t_block, mask_block, masked_block, ref_block)
+        if use_ref_frames:
+            ref_block = ref_latents_49ch[:, :, block_start_frame:block_end_frame]
+            x_49 = construct_49ch_block(x_t_block, mask_block, masked_block, ref_block)
+        else:
+            x_49 = construct_33ch_block(x_t_block, mask_block, masked_block)
         t_block = timestep_val.unsqueeze(1).expand(batch_size, latent_frames_per_block).float()
         x_list = [x_49[b] for b in range(batch_size)]
 
@@ -877,6 +910,7 @@ def validate(
         mode: "recon" (same video/audio) or "mixed" (different audio source)
         max_samples: Maximum number of validation samples to generate
     """
+    use_ref_frames = config.get("use_ref_frames", True)
     num_blocks = 7
     latent_frames_per_block = 3
     motion_frames_video = 73
@@ -955,7 +989,8 @@ def validate(
                 masked_latents = vae_encode_batch(vae, masked_video)
 
                 # Reference latents for 49ch
-                ref_latents_49ch = vae_encode_batch(vae, ref_frames)
+                if use_ref_frames:
+                    ref_latents_49ch = vae_encode_batch(vae, ref_frames)
 
                 # Reference latent for sink (single frame with temporal context)
                 ref_single = ref_frames[:, :, 0:1, :, :]
@@ -1002,12 +1037,16 @@ def validate(
 
             # ── Prepare tensors ───────────────────────────────────────────
             masked_latents = masked_latents.to(device, dtype=torch.bfloat16)
-            ref_latents_49ch = ref_latents_49ch.to(device, dtype=torch.bfloat16)
+            if use_ref_frames:
+                ref_latents_49ch = ref_latents_49ch.to(device, dtype=torch.bfloat16)
             ref_latents_sink = ref_latents_sink.to(device, dtype=torch.bfloat16)
             motion_latents = motion_latents.to(device, dtype=torch.bfloat16)
             mask_latent = mask_latent.to(device, dtype=torch.bfloat16)
 
-            ref_latents_padded = zero_pad_to_49ch(ref_latents_sink)
+            if use_ref_frames:
+                ref_latents_padded = zero_pad_to_49ch(ref_latents_sink)
+            else:
+                ref_latents_padded = zero_pad_to_33ch(ref_latents_sink)
             zeros_cond = torch.zeros(1, 16, latent_frames_per_block, H_lat, W_lat,
                                      device=device, dtype=torch.bfloat16)
 
@@ -1064,7 +1103,8 @@ def validate(
                 # Fixed conditioning for this block (doesn't change across timesteps)
                 mask_block = mask_latent[:, :, block_start:block_end]
                 masked_block = masked_latents[:, :, block_start:block_end]
-                ref_block = ref_latents_49ch[:, :, block_start:block_end]
+                if use_ref_frames:
+                    ref_block = ref_latents_49ch[:, :, block_start:block_end]
                 audio_block = audio_emb[..., block_idx * 12 : (block_idx + 1) * 12]
 
                 # Start from noise for this block
@@ -1081,8 +1121,11 @@ def validate(
                     if offload_kv_cache:
                         move_kv_cache_to_device(kv_caches[cache_key], device)
 
-                    # Construct 49ch input with current noisy block latents
-                    x_49 = construct_49ch_block(block_latents, mask_block, masked_block, ref_block)
+                    # Construct channel input with current noisy block latents
+                    if use_ref_frames:
+                        x_49 = construct_49ch_block(block_latents, mask_block, masked_block, ref_block)
+                    else:
+                        x_49 = construct_33ch_block(block_latents, mask_block, masked_block)
 
                     # Timestep tensor: [1, 3]
                     t_block = torch.tensor([t_val] * latent_frames_per_block,
@@ -1184,7 +1227,10 @@ def validate(
 
             # Free per-sample tensors
             del kv_caches, crossattn_cache, output_latents, x_t, decoded
-            del masked_latents, ref_latents_49ch, ref_latents_sink, motion_latents
+            if use_ref_frames:
+                del masked_latents, ref_latents_49ch, ref_latents_sink, motion_latents
+            else:
+                del masked_latents, ref_latents_sink, motion_latents
             del mask_latent, audio_emb, context
             torch.cuda.empty_cache()
 
