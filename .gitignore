@@ -116,3 +116,6 @@ Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/checkpoints/
 Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/models/
 Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/random30_subset/
 Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_from_nipa/
+
+# local outputs (backed up to HF, not git)
+val_outputs/

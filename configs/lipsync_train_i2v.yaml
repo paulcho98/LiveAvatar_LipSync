@@ -1,0 +1,79 @@
+# LiveAvatar LipSync Training — I2V Mode (original LiveAvatar I2V setting + diffusion loss)
+# Uses original 16-channel patch_embedding (frozen), uniform noise, full-frame MSE loss.
+# Reference conditioning via KV cache from GT frame 0 (matches LiveAvatar inference).
+
+# ── Key difference from other configs ──
+training_mode: "i2v"
+
+# Model paths
+checkpoint_dir: "/home/work/.local/LiveAvatar_LipSync/LiveAvatar/ckpt/Wan2.2-S2V-14B"
+vae_checkpoint: "Wan2.1_VAE.pth"
+wav2vec_model: "wav2vec2-large-xlsr-53-english"
+t5_checkpoint: "models_t5_umt5-xxl-enc-bf16.pth"
+t5_tokenizer: "google/umt5-xxl"
+
+# DMD LoRA (distillation for 4-step inference)
+dmd_lora_path: "/home/work/.local/LiveAvatar_LipSync/LiveAvatar/ckpt/LiveAvatar/liveavatar.safetensors"
+merge_dmd_lora: false
+
+# Data
+data_root: "/home/work/.local/combined_data/high_visual_quality"
+metadata_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_combined_latentsync_train.csv
+num_workers: 4
+
+# Pre-computation (run precompute_i2v_ref_latents.py after precompute_vae_latents.py)
+use_precomputed: true
+precomputed_csv: "/home/work/liveavatar_data/metadata_precomputed.csv"
+
+# Training
+batch_size: 1
+gradient_accumulation: 1
+learning_rate: 5.0e-5
+weight_decay: 0.01
+num_epochs: 50
+max_grad_norm: 1.0
+mixed_precision: "bf16"
+
+# Video
+height: 512
+width: 512
+num_frames: 81
+
+# LoRA
+lora_rank: 128
+lora_alpha: 64.0
+lora_targets: "q,k,v,o,ffn.0,ffn.2"
+
+# Dropout
+text_dropout: 0.1
+audio_dropout: 0.1
+
+# Loss
+timestep_loss_weight: false
+
+# Logging & checkpointing
+output_dir: "outputs/lipsync_i2v"
+save_steps: 500
+log_steps: 1
+
+# Validation
+validate_before_training: true
+val_steps: 50
+val_recon_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_hallo3_latentsync_validation_subset_10.csv
+val_mixed_csv: /home/work/.local/LiveAvatar_LipSync/Self_Forcing_Lipsync_StableAvatar/examples/wanvideo/model_training/metadata_hallo3_latentsync_validation_subset_mixed.csv
+val_num_samples: 5
+val_output_dir: "val_outputs/i2v"
+
+# Wandb
+use_wandb: true
+wandb_project: "LiveAvatar-LipSync"
+wandb_entity: "paulhcho"
+wandb_run_name: "i2v"
+wandb_api_key: "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"
+wandb_log_every: 1
+wandb_run_id: null
+
+# SyncNet metrics
+compute_sync_metrics: true
+syncnet_model_path: "/home/work/.local/LatentSync/checkpoints/auxiliary/syncnet_v2.model"
+s3fd_model_path: "/home/work/.local/LatentSync/checkpoints/auxiliary/sfd_face.pth"
